@@ -1,0 +1,344 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+import io
+import plotly.graph_objects as go
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# ==========================================
+# CONFIGURACIÓN DE PÁGINA
+# ==========================================
+st.set_page_config(page_title="Monitor DSO | Cobranzas", layout="wide", page_icon="📈")
+
+# ==========================================
+# SISTEMA DE LOGIN Y ROLES
+# ==========================================
+if "role" not in st.session_state:
+    st.session_state.role = None
+
+if st.session_state.role is None:
+    st.markdown("<h2 style='text-align: center;'>🔐 Acceso al Sistema DSO</h2>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        with st.form("login_form"):
+            usuario = st.text_input("Usuario")
+            password = st.text_input("Contraseña", type="password")
+            submit = st.form_submit_button("Ingresar", use_container_width=True)
+            
+            if submit:
+                if usuario == "admin" and password == "admin123":
+                    st.session_state.role = "admin"
+                    st.rerun()
+                elif usuario == "visor" and password == "visor123":
+                    st.session_state.role = "visor"
+                    st.rerun()
+                else:
+                    st.error("Credenciales incorrectas")
+    st.stop()
+
+# Botón de cierre de sesión
+with st.sidebar:
+    st.markdown(f"**Usuario:** {st.session_state.role.upper()}")
+    if st.button("Cerrar Sesión"):
+        st.session_state.role = None
+        st.rerun()
+
+# ==========================================
+# FUNCIONES DE PROCESAMIENTO
+# ==========================================
+def parse_amount(val):
+    if pd.isna(val): return 0.0
+    if isinstance(val, (int, float)): return float(val)
+    s = str(val).replace('$', '').strip()
+    if ',' in s and '.' in s:
+        if s.find('.') < s.find(','):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+def clean_client_name(name):
+    return re.sub(r'^\d+[-\s]*', '', str(name)).strip()
+
+@st.cache_data
+def process_excel(file):
+    df_raw = pd.read_excel(file, header=None)
+    header_idx = -1
+    cols = {'sujeto': -1, 'fecha': -1, 'subdiario': -1, 'importe': -1}
+    
+    for i in range(min(15, len(df_raw))):
+        row = df_raw.iloc[i].astype(str).str.lower().str.strip()
+        s_idx = row[row.str.contains('sujeto|cliente')].index
+        f_idx = row[row.str.contains('fecha')].index
+        d_idx = row[row.str.contains('subdiario|tipo')].index
+        i_idx = row[row.str.contains('importe|saldo')].index
+        
+        if len(s_idx) > 0 and len(f_idx) > 0 and len(d_idx) > 0:
+            header_idx = i
+            cols['sujeto'] = s_idx[0]
+            cols['fecha'] = f_idx[0]
+            cols['subdiario'] = d_idx[0]
+            if len(i_idx) > 0: cols['importe'] = i_idx[0]
+            break
+
+    if header_idx == -1 or cols['importe'] == -1:
+        return None, "No se encontraron las columnas requeridas."
+
+    df_data = df_raw.iloc[header_idx+1:].copy()
+    df_clean = pd.DataFrame({
+        'Sujeto_Original': df_data.iloc[:, cols['sujeto']].astype(str).replace('nan', np.nan),
+        'Fecha': pd.to_datetime(df_data.iloc[:, cols['fecha']], errors='coerce'),
+        'Subdiario': df_data.iloc[:, cols['subdiario']].astype(str).str.upper(),
+        'Importe': df_data.iloc[:, cols['importe']].apply(parse_amount)
+    }).dropna(subset=['Sujeto_Original', 'Fecha'])
+    
+    df_clean = df_clean[df_clean['Importe'] != 0]
+    df_clean['Sujeto'] = df_clean['Sujeto_Original'].apply(clean_client_name)
+    df_clean['Tipo'] = np.where(df_clean['Subdiario'].str.contains('VTA'), 'Factura / NC', 
+                       np.where(df_clean['Subdiario'].str.contains('COB'), 'Recibo', 'Otro'))
+    
+    return df_clean, "OK"
+
+def evaluate_client_fifo(df_client):
+    df_client = df_client.sort_values(by='Fecha')
+    invoice_queue = []
+    collections = []
+    total_billed = 0
+    total_collected = 0
+    
+    for _, row in df_client.iterrows():
+        fecha = row['Fecha']
+        importe = row['Importe']
+        subdiario = row['Subdiario']
+        
+        if 'VTA' in subdiario:
+            if importe > 0:
+                total_billed += importe
+                invoice_queue.append({'fecha': fecha, 'saldo': importe})
+            else:
+                # Nota de Crédito
+                payment_rem = abs(importe)
+                while invoice_queue and payment_rem > 0.001:
+                    inv = invoice_queue[0]
+                    apply_amt = min(inv['saldo'], payment_rem)
+                    inv['saldo'] -= apply_amt
+                    payment_rem -= apply_amt
+                    if inv['saldo'] <= 0.001:
+                        invoice_queue.pop(0)
+                        
+        elif 'COB' in subdiario:
+            payment_rem = abs(importe)
+            total_collected += payment_rem
+            weighted_days = 0
+            amount_applied = 0
+            
+            while invoice_queue and payment_rem > 0.001:
+                inv = invoice_queue[0]
+                apply_amt = min(inv['saldo'], payment_rem)
+                diff_days = max(0, (fecha - inv['fecha']).days)
+                
+                inv['saldo'] -= apply_amt
+                payment_rem -= apply_amt
+                weighted_days += (diff_days * apply_amt)
+                amount_applied += apply_amt
+                
+                if inv['saldo'] <= 0.001:
+                    invoice_queue.pop(0)
+            
+            final_days = weighted_days / amount_applied if amount_applied > 0 else 0
+            if amount_applied > 0:
+                collections.append({'fecha': fecha, 'importe': abs(importe), 'dias': round(final_days), 'monto_aplicado': amount_applied})
+                
+    open_balance = sum(inv['saldo'] for inv in invoice_queue)
+    return collections, total_billed, total_collected, open_balance
+
+def calculate_ai_stats(collections):
+    if len(collections) < 2: return None
+    dias = [c['dias'] for c in collections]
+    n = len(dias)
+    x = np.arange(n)
+    slope, _ = np.polyfit(x, np.array(dias), 1)
+    
+    mid = n // 2
+    avg_first = np.mean(dias[:mid])
+    avg_second = np.mean(dias[mid:])
+    diff_pct = ((avg_second - avg_first) / avg_first * 100) if avg_first > 0 else 0
+    max_peak = max(dias)
+    
+    if slope > 0.4 or diff_pct > 15:
+        return {'avg_first': avg_first, 'avg_second': avg_second, 'diff_pct': diff_pct, 'max_peak': max_peak, 'slope': slope, 'color': "#EF4444", 'estado': "Desmejoró"}
+    elif slope < -0.4 or diff_pct < -15:
+        return {'avg_first': avg_first, 'avg_second': avg_second, 'diff_pct': diff_pct, 'max_peak': max_peak, 'slope': slope, 'color': "#10B981", 'estado': "Mejoró"}
+    else:
+        return {'avg_first': avg_first, 'avg_second': avg_second, 'diff_pct': diff_pct, 'max_peak': max_peak, 'slope': slope, 'color': "#F59E0B", 'estado': "Estable"}
+
+# ==========================================
+# EXPORTACIÓN Y GOOGLE SHEETS
+# ==========================================
+def generate_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Base_DSO')
+        workbook = writer.book
+        worksheet = writer.sheets['Base_DSO']
+        
+        # Formato profesional
+        header_format = workbook.add_format({'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#1E293B', 'font_color': 'white', 'border': 1})
+        money_format = workbook.add_format({'num_format': '$#,##0.00'})
+        date_format = workbook.add_format({'num_format': 'dd/mm/yyyy'})
+        
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+            
+        worksheet.set_column('A:A', 30) # Sujeto
+        worksheet.set_column('B:B', 15, date_format) # Fecha
+        worksheet.set_column('C:D', 15)
+        worksheet.set_column('E:E', 20, money_format) # Importe
+    return output.getvalue()
+
+def save_to_google_sheets(df):
+    try:
+        # Requiere archivo credenciales.json de Google Cloud en la misma carpeta
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("Reporte_DSO_Consolidado").sheet1
+        sheet.clear()
+        # Formatear fechas para JSON
+        df_export = df.copy()
+        df_export['Fecha'] = df_export['Fecha'].astype(str)
+        sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
+        return True
+    except Exception as e:
+        return str(e)
+
+# ==========================================
+# INTERFAZ PRINCIPAL
+# ==========================================
+st.title("📊 Monitor de Días en la Calle (DSO) & Análisis de Crédito")
+
+if st.session_state.role == "admin":
+    uploaded_file = st.file_uploader("Cargar Asientos Contables (Excel)", type=["xlsx", "xls"])
+else:
+    st.info("Modo Visor: Esperando que el Administrador procese los datos o leyendo desde base central.")
+    uploaded_file = None # Aquí podrías cargar directo desde Google Sheets si lo deseas.
+
+# Variable en sesión para mantener los datos procesados sin recargar
+if uploaded_file and "df_base" not in st.session_state:
+    with st.spinner("Procesando movimientos contables..."):
+        df, status = process_excel(uploaded_file)
+        if df is not None:
+            st.session_state.df_base = df
+            st.success("¡Archivo procesado con éxito!")
+
+if "df_base" in st.session_state:
+    df = st.session_state.df_base
+    clientes = sorted(df['Sujeto'].unique())
+    
+    # Botones de Acción (Solo Admin)
+    if st.session_state.role == "admin":
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            st.download_button(
+                label="📥 Descargar Excel Formateado",
+                data=generate_excel(df),
+                file_name=f"Reporte_DSO_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with col_btn2:
+            if st.button("☁️ Guardar en Google Sheets", use_container_width=True):
+                with st.spinner("Sincronizando..."):
+                    res = save_to_google_sheets(df)
+                    if res is True: st.success("Guardado en Sheets correctamente")
+                    else: st.warning(f"Error (Revisar credenciales.json): {res}")
+
+    # Tabs
+    tab1, tab2 = st.tabs(["📑 Detalle por Cliente", "📋 Cuadro Analítico Resumen"])
+    
+    # ------------------------------------------
+    # SOLAPA 1: DETALLE POR CLIENTE
+    # ------------------------------------------
+    with tab1:
+        selected_client = st.selectbox("Seleccionar Cliente:", clientes)
+        df_client = df[df['Sujeto'] == selected_client]
+        colls, billed, collected, balance = evaluate_client_fifo(df_client)
+        stats = calculate_ai_stats(colls)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        avg_days = int(np.average([c['dias'] for c in colls], weights=[c['monto_aplicado'] for c in colls])) if colls else 0
+        col1.metric("Promedio Ponderado", f"{avg_days} días")
+        col2.metric("Total Facturado", f"${billed:,.0f}")
+        col3.metric("Total Cobrado", f"${collected:,.0f}")
+        col4.metric("Saldo Abierto Estimado", f"${balance:,.0f}")
+        
+        if colls:
+            st.markdown("### Evolución de Pagos")
+            fig = go.Figure()
+            fechas = [c['fecha'].strftime('%d/%m/%Y') for c in colls]
+            dias = [c['dias'] for c in colls]
+            fig.add_trace(go.Bar(x=fechas, y=dias, name="Días en Calle", marker_color="#6366f1"))
+            fig.add_trace(go.Scatter(x=fechas, y=[avg_days]*len(dias), mode='lines', name="Promedio", line=dict(color='red', dash='dash')))
+            fig.update_layout(height=350, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor='rgba(0,0,0,0)')
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ------------------------------------------
+    # SOLAPA 2: CUADRO GENERAL CON DESPLEGABLES
+    # ------------------------------------------
+    with tab2:
+        st.markdown("### Resumen de Cartera y Detalle de Comprobantes")
+        
+        # Filtro de Ordenamiento (Disponible para ambos roles)
+        orden = st.radio("Ordenar cuadro por:", ["Alfabético", "Mayor deterioro", "Mejor evolución"], horizontal=True)
+        
+        # Pre-calcular stats para ordenar
+        lista_clientes = []
+        for c in clientes:
+            df_c = df[df['Sujeto'] == c]
+            c_colls, _, _, _ = evaluate_client_fifo(df_c)
+            c_stats = calculate_ai_stats(c_colls)
+            if c_stats:
+                lista_clientes.append({'cliente': c, 'stats': c_stats, 'df': df_c})
+                
+        if orden == "Mayor deterioro":
+            lista_clientes.sort(key=lambda x: x['stats']['diff_pct'], reverse=True)
+        elif orden == "Mejor evolución":
+            lista_clientes.sort(key=lambda x: x['stats']['diff_pct'])
+            
+        for item in lista_clientes:
+            cliente = item['cliente']
+            stats_c = item['stats']
+            df_hist = item['df'].sort_values(by='Fecha', ascending=False)[['Fecha', 'Subdiario', 'Importe']]
+            
+            sign_var = "+" if stats_c['diff_pct'] > 0 else ""
+            sign_slope = "+" if stats_c['slope'] > 0 else ""
+            
+            # HTML de la Tarjeta Flotante
+            st.markdown(f"""
+            <div style="border: 2px solid {stats_c['color']}; border-radius: 12px; padding: 15px 20px; background-color: #ffffff; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px rgba(0,0,0,0.05); color: #1e293b; margin-top: 15px;">
+                <div style="font-weight: 700; font-size: 15px; flex: 1; min-width: 200px;">
+                    {cliente}
+                </div>
+                <div style="flex: 3; display: flex; flex-wrap: wrap; justify-content: space-between; font-size: 13px; gap: 15px;">
+                    <div style="background: #f8fafc; padding: 5px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">Promedio: <b>{int(stats_c['avg_first'])}d ➔ {int(stats_c['avg_second'])}d</b></div>
+                    <div style="background: #f8fafc; padding: 5px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">Variación: <b style="color: {stats_c['color']};">{sign_var}{stats_c['diff_pct']:.1f}%</b></div>
+                    <div style="background: #f8fafc; padding: 5px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">Pico Máx: <b>{stats_c['max_peak']}d</b></div>
+                    <div style="background: #f8fafc; padding: 5px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">Tendencia: <b>{sign_slope}{stats_c['slope']:.2f}</b></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Expander justo debajo de la tarjeta para ver los comprobantes
+            with st.expander(f"Ver detalle de movimientos (VTA, COB, NC) de {cliente}"):
+                # Damos formato a la tablita interna
+                df_hist['Fecha'] = df_hist['Fecha'].dt.strftime('%d/%m/%Y')
+                df_hist['Importe'] = df_hist['Importe'].apply(lambda x: f"${x:,.2f}")
+                st.dataframe(df_hist, use_container_width=True, hide_index=True)
