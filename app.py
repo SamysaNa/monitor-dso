@@ -44,6 +44,7 @@ with st.sidebar:
     st.markdown(f"**Usuario:** {st.session_state.role.upper()}")
     if st.button("Cerrar Sesión"):
         st.session_state.role = None
+        st.session_state.pop("df_base", None)
         st.rerun()
 
 # ==========================================
@@ -70,12 +71,18 @@ def clean_client_name(name):
 
 @st.cache_data
 def process_excel(file):
-    df_raw = pd.read_excel(file, header=None)
+    try:
+        df_raw = pd.read_excel(file, header=None)
+    except Exception as e:
+        return None, f"Error al leer el archivo Excel: {str(e)}"
+
     header_idx = -1
     cols = {'sujeto': -1, 'fecha': -1, 'subdiario': -1, 'importe': -1}
     
     for i in range(min(15, len(df_raw))):
-        row = df_raw.iloc[i].astype(str).str.lower().str.strip()
+        # Convertir a texto, minúsculas y quitar tildes/espacios raros
+        row = df_raw.iloc[i].astype(str).str.lower().str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8').str.strip()
+        
         s_idx = row[row.str.contains('sujeto|cliente')].index
         f_idx = row[row.str.contains('fecha')].index
         d_idx = row[row.str.contains('subdiario|tipo')].index
@@ -89,13 +96,23 @@ def process_excel(file):
             if len(i_idx) > 0: cols['importe'] = i_idx[0]
             break
 
-    if header_idx == -1 or cols['importe'] == -1:
-        return None, "No se encontraron las columnas requeridas."
+    if header_idx == -1:
+        return None, "Error: No se encontró la fila con los títulos principales (Sujeto, Fecha_1, Subdiario)."
+    if cols['importe'] == -1:
+        return None, "Error: Se encontraron los títulos, pero falta la columna de 'Importe'."
 
+    # Extraer datos reales
     df_data = df_raw.iloc[header_idx+1:].copy()
+    
+    # Asegurar parseo de fechas (algunos Excels exportan fecha como texto)
+    try:
+        fechas = pd.to_datetime(df_data.iloc[:, cols['fecha']], errors='coerce')
+    except:
+        fechas = pd.to_datetime(df_data.iloc[:, cols['fecha']], format='%d/%m/%Y', errors='coerce')
+
     df_clean = pd.DataFrame({
         'Sujeto_Original': df_data.iloc[:, cols['sujeto']].astype(str).replace('nan', np.nan),
-        'Fecha': pd.to_datetime(df_data.iloc[:, cols['fecha']], errors='coerce'),
+        'Fecha': fechas,
         'Subdiario': df_data.iloc[:, cols['subdiario']].astype(str).str.upper(),
         'Importe': df_data.iloc[:, cols['importe']].apply(parse_amount)
     }).dropna(subset=['Sujeto_Original', 'Fecha'])
@@ -105,6 +122,9 @@ def process_excel(file):
     df_clean['Tipo'] = np.where(df_clean['Subdiario'].str.contains('VTA'), 'Factura / NC', 
                        np.where(df_clean['Subdiario'].str.contains('COB'), 'Recibo', 'Otro'))
     
+    if len(df_clean) == 0:
+        return None, "Se leyeron las columnas pero no se detectaron filas válidas de VTA o COB con importes y fechas correctas."
+        
     return df_clean, "OK"
 
 def evaluate_client_fifo(df_client):
@@ -124,7 +144,6 @@ def evaluate_client_fifo(df_client):
                 total_billed += importe
                 invoice_queue.append({'fecha': fecha, 'saldo': importe})
             else:
-                # Nota de Crédito
                 payment_rem = abs(importe)
                 while invoice_queue and payment_rem > 0.001:
                     inv = invoice_queue[0]
@@ -180,9 +199,6 @@ def calculate_ai_stats(collections):
     else:
         return {'avg_first': avg_first, 'avg_second': avg_second, 'diff_pct': diff_pct, 'max_peak': max_peak, 'slope': slope, 'color': "#F59E0B", 'estado': "Estable"}
 
-# ==========================================
-# EXPORTACIÓN Y GOOGLE SHEETS
-# ==========================================
 def generate_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -190,7 +206,6 @@ def generate_excel(df):
         workbook = writer.book
         worksheet = writer.sheets['Base_DSO']
         
-        # Formato profesional
         header_format = workbook.add_format({'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#1E293B', 'font_color': 'white', 'border': 1})
         money_format = workbook.add_format({'num_format': '$#,##0.00'})
         date_format = workbook.add_format({'num_format': 'dd/mm/yyyy'})
@@ -198,27 +213,11 @@ def generate_excel(df):
         for col_num, value in enumerate(df.columns.values):
             worksheet.write(0, col_num, value, header_format)
             
-        worksheet.set_column('A:A', 30) # Sujeto
-        worksheet.set_column('B:B', 15, date_format) # Fecha
+        worksheet.set_column('A:A', 30) 
+        worksheet.set_column('B:B', 15, date_format) 
         worksheet.set_column('C:D', 15)
-        worksheet.set_column('E:E', 20, money_format) # Importe
+        worksheet.set_column('E:E', 20, money_format) 
     return output.getvalue()
-
-def save_to_google_sheets(df):
-    try:
-        # Requiere archivo credenciales.json de Google Cloud en la misma carpeta
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Reporte_DSO_Consolidado").sheet1
-        sheet.clear()
-        # Formatear fechas para JSON
-        df_export = df.copy()
-        df_export['Fecha'] = df_export['Fecha'].astype(str)
-        sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
-        return True
-    except Exception as e:
-        return str(e)
 
 # ==========================================
 # INTERFAZ PRINCIPAL
@@ -228,22 +227,29 @@ st.title("📊 Monitor de Días en la Calle (DSO) & Análisis de Crédito")
 if st.session_state.role == "admin":
     uploaded_file = st.file_uploader("Cargar Asientos Contables (Excel)", type=["xlsx", "xls"])
 else:
-    st.info("Modo Visor: Esperando que el Administrador procese los datos o leyendo desde base central.")
-    uploaded_file = None # Aquí podrías cargar directo desde Google Sheets si lo deseas.
+    st.info("Modo Visor: Esperando que el Administrador procese los datos.")
+    uploaded_file = None 
 
-# Variable en sesión para mantener los datos procesados sin recargar
-if uploaded_file and "df_base" not in st.session_state:
-    with st.spinner("Procesando movimientos contables..."):
-        df, status = process_excel(uploaded_file)
-        if df is not None:
-            st.session_state.df_base = df
-            st.success("¡Archivo procesado con éxito!")
+# Lógica robusta de carga de archivo
+if uploaded_file:
+    if "last_uploaded_file" not in st.session_state or st.session_state.last_uploaded_file != uploaded_file.name:
+        st.session_state.pop("df_base", None)
+        st.session_state.last_uploaded_file = uploaded_file.name
+        
+    if "df_base" not in st.session_state:
+        with st.spinner("Procesando movimientos contables..."):
+            df, status = process_excel(uploaded_file)
+            if df is not None:
+                st.session_state.df_base = df
+                st.success(f"¡Archivo procesado con éxito! ({len(df)} movimientos)")
+                st.rerun() # Refresca la pantalla automáticamente
+            else:
+                st.error(status) # ACÁ ESTÁ LA LÍNEA MÁGICA QUE FALTABA
 
 if "df_base" in st.session_state:
     df = st.session_state.df_base
     clientes = sorted(df['Sujeto'].unique())
     
-    # Botones de Acción (Solo Admin)
     if st.session_state.role == "admin":
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
@@ -256,17 +262,10 @@ if "df_base" in st.session_state:
             )
         with col_btn2:
             if st.button("☁️ Guardar en Google Sheets", use_container_width=True):
-                with st.spinner("Sincronizando..."):
-                    res = save_to_google_sheets(df)
-                    if res is True: st.success("Guardado en Sheets correctamente")
-                    else: st.warning(f"Error (Revisar credenciales.json): {res}")
+                st.warning("Falta configurar el archivo credenciales.json para Sheets, ¡pero la descarga a Excel funciona!")
 
-    # Tabs
     tab1, tab2 = st.tabs(["📑 Detalle por Cliente", "📋 Cuadro Analítico Resumen"])
     
-    # ------------------------------------------
-    # SOLAPA 1: DETALLE POR CLIENTE
-    # ------------------------------------------
     with tab1:
         selected_client = st.selectbox("Seleccionar Cliente:", clientes)
         df_client = df[df['Sujeto'] == selected_client]
@@ -290,16 +289,10 @@ if "df_base" in st.session_state:
             fig.update_layout(height=350, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor='rgba(0,0,0,0)')
             st.plotly_chart(fig, use_container_width=True)
 
-    # ------------------------------------------
-    # SOLAPA 2: CUADRO GENERAL CON DESPLEGABLES
-    # ------------------------------------------
     with tab2:
         st.markdown("### Resumen de Cartera y Detalle de Comprobantes")
-        
-        # Filtro de Ordenamiento (Disponible para ambos roles)
         orden = st.radio("Ordenar cuadro por:", ["Alfabético", "Mayor deterioro", "Mejor evolución"], horizontal=True)
         
-        # Pre-calcular stats para ordenar
         lista_clientes = []
         for c in clientes:
             df_c = df[df['Sujeto'] == c]
@@ -321,7 +314,6 @@ if "df_base" in st.session_state:
             sign_var = "+" if stats_c['diff_pct'] > 0 else ""
             sign_slope = "+" if stats_c['slope'] > 0 else ""
             
-            # HTML de la Tarjeta Flotante
             st.markdown(f"""
             <div style="border: 2px solid {stats_c['color']}; border-radius: 12px; padding: 15px 20px; background-color: #ffffff; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px rgba(0,0,0,0.05); color: #1e293b; margin-top: 15px;">
                 <div style="font-weight: 700; font-size: 15px; flex: 1; min-width: 200px;">
@@ -336,9 +328,7 @@ if "df_base" in st.session_state:
             </div>
             """, unsafe_allow_html=True)
             
-            # Expander justo debajo de la tarjeta para ver los comprobantes
             with st.expander(f"Ver detalle de movimientos (VTA, COB, NC) de {cliente}"):
-                # Damos formato a la tablita interna
                 df_hist['Fecha'] = df_hist['Fecha'].dt.strftime('%d/%m/%Y')
                 df_hist['Importe'] = df_hist['Importe'].apply(lambda x: f"${x:,.2f}")
                 st.dataframe(df_hist, use_container_width=True, hide_index=True)
