@@ -80,8 +80,8 @@ def process_excel(file):
     cols = {'sujeto': -1, 'fecha': -1, 'subdiario': -1, 'importe': -1}
     
     for i in range(min(15, len(df_raw))):
-        # Convertir a texto, minúsculas y quitar tildes/espacios raros
-        row = df_raw.iloc[i].astype(str).str.lower().str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8').str.strip()
+        # Limpieza simplificada para evitar el AttributeError en Pandas
+        row = df_raw.iloc[i].astype(str).str.lower().str.strip()
         
         s_idx = row[row.str.contains('sujeto|cliente')].index
         f_idx = row[row.str.contains('fecha')].index
@@ -104,7 +104,7 @@ def process_excel(file):
     # Extraer datos reales
     df_data = df_raw.iloc[header_idx+1:].copy()
     
-    # Asegurar parseo de fechas (algunos Excels exportan fecha como texto)
+    # Asegurar parseo de fechas
     try:
         fechas = pd.to_datetime(df_data.iloc[:, cols['fecha']], errors='coerce')
     except:
@@ -244,7 +244,7 @@ if uploaded_file:
                 st.success(f"¡Archivo procesado con éxito! ({len(df)} movimientos)")
                 st.rerun() # Refresca la pantalla automáticamente
             else:
-                st.error(status) # ACÁ ESTÁ LA LÍNEA MÁGICA QUE FALTABA
+                st.error(status) 
 
 if "df_base" in st.session_state:
     df = st.session_state.df_base
