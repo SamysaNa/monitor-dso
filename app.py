@@ -5,8 +5,6 @@ import re
 import io
 import plotly.graph_objects as go
 from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 # ==========================================
 # CONFIGURACIÓN DE PÁGINA
@@ -39,7 +37,6 @@ if st.session_state.role is None:
                     st.error("Credenciales incorrectas")
     st.stop()
 
-# Botón de cierre de sesión
 with st.sidebar:
     st.markdown(f"**Usuario:** {st.session_state.role.upper()}")
     if st.button("Cerrar Sesión"):
@@ -53,7 +50,12 @@ with st.sidebar:
 def parse_amount(val):
     if pd.isna(val): return 0.0
     if isinstance(val, (int, float)): return float(val)
-    s = str(val).replace('$', '').strip()
+    s = str(val).strip()
+    
+    is_negative = '-' in s or (s.startswith('(') and s.endswith(')'))
+    s = re.sub(r'[^\d,\.]', '', s) # Deja solo números y separadores
+    if not s: return 0.0
+    
     if ',' in s and '.' in s:
         if s.find('.') < s.find(','):
             s = s.replace('.', '').replace(',', '.')
@@ -61,8 +63,10 @@ def parse_amount(val):
             s = s.replace(',', '')
     elif ',' in s:
         s = s.replace(',', '.')
+        
     try:
-        return float(s)
+        num = float(s)
+        return -num if is_negative else num
     except:
         return 0.0
 
@@ -72,60 +76,51 @@ def clean_client_name(name):
 @st.cache_data
 def process_excel(file):
     try:
-        df_raw = pd.read_excel(file, header=None)
+        # header=2 salta las 2 primeras filas (código y vacía)
+        df_raw = pd.read_excel(file, header=2)
     except Exception as e:
-        return None, f"Error al leer el archivo Excel: {str(e)}"
+        return None, f"Error al leer el archivo Excel: {str(e)}", None
 
-    header_idx = -1
-    cols = {'sujeto': -1, 'fecha': -1, 'subdiario': -1, 'importe': -1}
+    cols_lower = [str(c).lower().strip() for c in df_raw.columns]
     
-    for i in range(min(15, len(df_raw))):
-        # Limpieza simplificada para evitar el AttributeError en Pandas
-        row = df_raw.iloc[i].astype(str).str.lower().str.strip()
+    col_sujeto = -1
+    col_fecha = -1
+    col_subdiario = -1
+    col_importe = -1
+    
+    # Búsqueda estricta (agarra la primera coincidencia y no se pisa)
+    for i, c in enumerate(cols_lower):
+        if col_sujeto == -1 and ('sujeto' in c or 'cliente' in c): col_sujeto = i
+        elif col_fecha == -1 and ('fecha' in c): col_fecha = i
+        elif col_subdiario == -1 and ('subdiario' in c): col_subdiario = i
+        elif col_importe == -1 and ('importe' in c or 'saldo' in c): col_importe = i
         
-        s_idx = row[row.str.contains('sujeto|cliente')].index
-        f_idx = row[row.str.contains('fecha')].index
-        d_idx = row[row.str.contains('subdiario|tipo')].index
-        i_idx = row[row.str.contains('importe|saldo')].index
-        
-        if len(s_idx) > 0 and len(f_idx) > 0 and len(d_idx) > 0:
-            header_idx = i
-            cols['sujeto'] = s_idx[0]
-            cols['fecha'] = f_idx[0]
-            cols['subdiario'] = d_idx[0]
-            if len(i_idx) > 0: cols['importe'] = i_idx[0]
-            break
+    if col_sujeto == -1 or col_fecha == -1 or col_subdiario == -1 or col_importe == -1:
+        debug_info = pd.DataFrame({"Columnas Detectadas": list(df_raw.columns)})
+        return None, "Error: No detecté las columnas correctas. Verificá los títulos de la Fila 3.", debug_info
 
-    if header_idx == -1:
-        return None, "Error: No se encontró la fila con los títulos principales (Sujeto, Fecha_1, Subdiario)."
-    if cols['importe'] == -1:
-        return None, "Error: Se encontraron los títulos, pero falta la columna de 'Importe'."
-
-    # Extraer datos reales
-    df_data = df_raw.iloc[header_idx+1:].copy()
+    df_data = df_raw.iloc[:, [col_sujeto, col_fecha, col_subdiario, col_importe]].copy()
+    df_data.columns = ['Sujeto_Original', 'Fecha', 'Subdiario', 'Importe']
     
-    # Asegurar parseo de fechas
-    try:
-        fechas = pd.to_datetime(df_data.iloc[:, cols['fecha']], errors='coerce')
-    except:
-        fechas = pd.to_datetime(df_data.iloc[:, cols['fecha']], format='%d/%m/%Y', errors='coerce')
-
-    df_clean = pd.DataFrame({
-        'Sujeto_Original': df_data.iloc[:, cols['sujeto']].astype(str).replace('nan', np.nan),
-        'Fecha': fechas,
-        'Subdiario': df_data.iloc[:, cols['subdiario']].astype(str).str.upper(),
-        'Importe': df_data.iloc[:, cols['importe']].apply(parse_amount)
-    }).dropna(subset=['Sujeto_Original', 'Fecha'])
+    df_data = df_data.dropna(subset=['Sujeto_Original', 'Subdiario'])
     
-    df_clean = df_clean[df_clean['Importe'] != 0]
-    df_clean['Sujeto'] = df_clean['Sujeto_Original'].apply(clean_client_name)
-    df_clean['Tipo'] = np.where(df_clean['Subdiario'].str.contains('VTA'), 'Factura / NC', 
-                       np.where(df_clean['Subdiario'].str.contains('COB'), 'Recibo', 'Otro'))
+    if not pd.api.types.is_datetime64_any_dtype(df_data['Fecha']):
+        df_data['Fecha'] = pd.to_datetime(df_data['Fecha'], errors='coerce')
+    df_data = df_data.dropna(subset=['Fecha']) 
+    
+    df_data['Importe_Num'] = df_data['Importe'].apply(parse_amount)
+    df_data = df_data[df_data['Importe_Num'] != 0].copy()
+    
+    df_data['Sujeto'] = df_data['Sujeto_Original'].apply(clean_client_name)
+    df_data['Subdiario'] = df_data['Subdiario'].astype(str).str.upper()
+    
+    df_clean = df_data[df_data['Subdiario'].str.contains('VTA|COB')].copy()
     
     if len(df_clean) == 0:
-        return None, "Se leyeron las columnas pero no se detectaron filas válidas de VTA o COB con importes y fechas correctas."
+        debug_info = df_data.head(15).astype(str)
+        return None, "Se leyeron las columnas pero los importes dieron 0. Revisá el diagnóstico.", debug_info
         
-    return df_clean, "OK"
+    return df_clean, "OK", None
 
 def evaluate_client_fifo(df_client):
     df_client = df_client.sort_values(by='Fecha')
@@ -136,14 +131,14 @@ def evaluate_client_fifo(df_client):
     
     for _, row in df_client.iterrows():
         fecha = row['Fecha']
-        importe = row['Importe']
+        importe = row['Importe_Num']
         subdiario = row['Subdiario']
         
         if 'VTA' in subdiario:
             if importe > 0:
                 total_billed += importe
                 invoice_queue.append({'fecha': fecha, 'saldo': importe})
-            else:
+            else: 
                 payment_rem = abs(importe)
                 while invoice_queue and payment_rem > 0.001:
                     inv = invoice_queue[0]
@@ -202,7 +197,7 @@ def calculate_ai_stats(collections):
 def generate_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Base_DSO')
+        df.to_excel(writer, index=False, sheet_name='Base_DSO', columns=['Sujeto_Original', 'Fecha', 'Subdiario', 'Importe_Num'])
         workbook = writer.book
         worksheet = writer.sheets['Base_DSO']
         
@@ -210,13 +205,13 @@ def generate_excel(df):
         money_format = workbook.add_format({'num_format': '$#,##0.00'})
         date_format = workbook.add_format({'num_format': 'dd/mm/yyyy'})
         
-        for col_num, value in enumerate(df.columns.values):
+        for col_num, value in enumerate(['Sujeto_Original', 'Fecha', 'Subdiario', 'Importe_Num']):
             worksheet.write(0, col_num, value, header_format)
             
         worksheet.set_column('A:A', 30) 
         worksheet.set_column('B:B', 15, date_format) 
-        worksheet.set_column('C:D', 15)
-        worksheet.set_column('E:E', 20, money_format) 
+        worksheet.set_column('C:C', 15)
+        worksheet.set_column('D:D', 20, money_format) 
     return output.getvalue()
 
 # ==========================================
@@ -230,7 +225,6 @@ else:
     st.info("Modo Visor: Esperando que el Administrador procese los datos.")
     uploaded_file = None 
 
-# Lógica robusta de carga de archivo
 if uploaded_file:
     if "last_uploaded_file" not in st.session_state or st.session_state.last_uploaded_file != uploaded_file.name:
         st.session_state.pop("df_base", None)
@@ -238,13 +232,17 @@ if uploaded_file:
         
     if "df_base" not in st.session_state:
         with st.spinner("Procesando movimientos contables..."):
-            df, status = process_excel(uploaded_file)
+            df, status, debug_df = process_excel(uploaded_file)
+            
             if df is not None:
                 st.session_state.df_base = df
-                st.success(f"¡Archivo procesado con éxito! ({len(df)} movimientos)")
-                st.rerun() # Refresca la pantalla automáticamente
+                st.success(f"¡Archivo procesado con éxito! ({len(df)} comprobantes evaluados)")
+                st.rerun() 
             else:
                 st.error(status) 
+                if debug_df is not None:
+                    st.warning("🔍 MODO DIAGNÓSTICO: Columnas encontradas en el Excel.")
+                    st.dataframe(debug_df)
 
 if "df_base" in st.session_state:
     df = st.session_state.df_base
@@ -261,14 +259,19 @@ if "df_base" in st.session_state:
                 use_container_width=True
             )
         with col_btn2:
-            if st.button("☁️ Guardar en Google Sheets", use_container_width=True):
-                st.warning("Falta configurar el archivo credenciales.json para Sheets, ¡pero la descarga a Excel funciona!")
+            st.button("☁️ Guardar en Google Sheets", use_container_width=True)
 
     tab1, tab2 = st.tabs(["📑 Detalle por Cliente", "📋 Cuadro Analítico Resumen"])
     
     with tab1:
         selected_client = st.selectbox("Seleccionar Cliente:", clientes)
         df_client = df[df['Sujeto'] == selected_client]
+        
+        # ---------------- DIAGNÓSTICO VISUAL ----------------
+        with st.expander("🔍 Ver datos crudos de este cliente (¿Están bien los importes?)"):
+            st.dataframe(df_client[['Fecha', 'Subdiario', 'Importe', 'Importe_Num']], use_container_width=True, hide_index=True)
+        # ----------------------------------------------------
+        
         colls, billed, collected, balance = evaluate_client_fifo(df_client)
         stats = calculate_ai_stats(colls)
         
@@ -309,7 +312,8 @@ if "df_base" in st.session_state:
         for item in lista_clientes:
             cliente = item['cliente']
             stats_c = item['stats']
-            df_hist = item['df'].sort_values(by='Fecha', ascending=False)[['Fecha', 'Subdiario', 'Importe']]
+            df_hist = item['df'].sort_values(by='Fecha', ascending=False)[['Fecha', 'Subdiario', 'Importe_Num']]
+            df_hist.rename(columns={'Importe_Num': 'Importe'}, inplace=True)
             
             sign_var = "+" if stats_c['diff_pct'] > 0 else ""
             sign_slope = "+" if stats_c['slope'] > 0 else ""
